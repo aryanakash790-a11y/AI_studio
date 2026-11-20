@@ -307,7 +307,9 @@ class LiveRuntime:
             from ..tool_exec import set_tool_context, toolset_after_step, toolset_prompt
             set_tool_context(run_id=rid, workflow_id=run.workflow_id or "", agent=agent,
                              node_id=node_id, conversation_id=conversation_id,
-                             agent_tools=agent_tools)
+                             agent_tools=agent_tools,
+                             message=str((run.input or {}).get("message") or "")
+                             if isinstance(run.input, dict) else str(run.input or ""))
 
             # --- single ContextProvider seam (spec §2/§13) ---
             # With ontology OFF this returns a PlainProvider bundle whose only content

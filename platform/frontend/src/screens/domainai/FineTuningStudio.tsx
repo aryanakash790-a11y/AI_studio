@@ -73,7 +73,18 @@ function Workspace({ ses, hasConversation, onChanged }: { ses: any; hasConversat
             {ses.runtime_card?.status && <Tag minimal>{ses.runtime_card.status}</Tag>}
             {ses.runtime_card && !ses.runtime_card.usable && <Tag minimal intent="danger">{ses.runtime_card.problem}</Tag>}
           </div>
-        ) : <div className="muted">Not chosen yet — the assistant asks which runtime to use.</div>}
+        ) : null}
+        {ses?.runtime && ses.runtime_check && (
+          ses.runtime_check.ok
+            ? <details style={{ marginTop: 6 }}><summary className="muted" style={{ cursor: "pointer" }}>
+                <Icon icon="tick-circle" size={11} color="var(--success)" /> Runtime responded (checked {fmtWhen(ses.runtime_check.at)})</summary>
+                <pre style={{ margin: "4px 0 0", fontSize: 11, whiteSpace: "pre-wrap", fontFamily: "var(--mono)" }}>{ses.runtime_check.output}</pre></details>
+            : <Callout intent="danger" icon="offline" title="Runtime did not respond" style={{ marginTop: 6 }}>
+                <div style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{ses.runtime_check.output}</div>
+                <div className="muted" style={{ marginTop: 4 }}>Open the lab from Data Science Lab › Runtimes to see the connection steps, then ask the assistant to check again.</div>
+              </Callout>
+        )}
+        {!ses?.runtime && <div className="muted">Not chosen yet — the assistant asks which runtime to use.</div>}
         {runtimes && (
           <div style={{ marginTop: 8 }}>
             {!runtimes.dsl_enabled && <Callout intent="warning" icon="warning-sign">Data Science Lab is disabled.</Callout>}

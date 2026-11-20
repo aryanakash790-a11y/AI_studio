@@ -47,7 +47,8 @@ Chat / Fine-Tuning Studio ──POST /runs (one run per message, full history + 
 |---|---|
 | `ft_session_status` | current runtime, notebook + version, plan, recent jobs |
 | `ft_ask_user` | ask a question with clickable options and end the turn |
-| `ft_list_runtimes`, `ft_select_runtime` | the runtimes bound to this agent; record the user's choice |
+| `ft_list_runtimes`, `ft_select_runtime` | the runtimes bound to this agent; record the user's choice (tolerant: name, id, the clicked option, "yes" when only one exists) and check the runtime responds |
+| `ft_runtime_info`, `ft_run_python`, `ft_run_shell`, `ft_runtime_files` | act on the **selected** runtime through its bound DSLab MCP server; available in the same turn the runtime is chosen |
 | `ft_list_notebooks`, `ft_read_notebook` | templates (`finetuning/notebooks/`) and this conversation's drafts; cells with indices |
 | `ft_create_notebook` | new notebook from cells (markdown description + `parameters` cell) |
 | `ft_edit_notebook` | structured cell operations: `replace_cell`, `insert_cell`, `delete_cell`, `replace_text`, `set_parameters`, `set_tags` |
@@ -67,12 +68,19 @@ open any version.
 
 * `ft_list_runtimes` offers only the `DSLab · <runtime>` MCP servers bound to the agent. The agent
   must ask the user to choose one, even when only one exists.
-* Before a runtime is chosen, no runtime tools are exposed. After that, only the chosen runtime's
-  `run_python`, `run_shell`, `runtime_info`, `list_files`, `read_file`, `write_file`, `add_cell` and
-  `restart_kernel` are exposed, so the agent can check the environment or test a snippet.
-* The raw job-control tools (`start_notebook_job` …) and `run_notebook` are hidden from the agent.
-  Training starts only through a confirmed plan. The same scoping applies to the ADK runtime's
-  native MCP toolsets.
+* The runtime question is asked with `ft_ask_user(purpose="runtime")`: the platform fills the
+  options with its own labels (`vm1 · T4`) and records the user's click itself at the start of the
+  next turn. Selection does not depend on how the model reads "Yes".
+* The bound DSLab MCP servers' raw tools are never exposed. The agent reaches the selected runtime
+  through `ft_runtime_*`, which call that runtime's bound, enabled MCP server. This works in the
+  same turn the runtime is chosen, and job control (`start_notebook_job`, `run_notebook` …) stays
+  behind the confirmed plan. The ADK runtime's native MCP toolsets follow the same rule.
+* **Labs after a restart:** lab tunnels live in the backend process, so after every restart or
+  redeploy all labs are closed. Before any runtime call (selection check, `ft_runtime_*`, job
+  staging) the backend opens the lab itself (`remote.ensure_lab_open`). It does not rely on the MCP
+  server's auto-open, which runs inside one MCP call and can time out. If opening fails, the exact
+  reason (SSH, Jupyter start …) is returned to the agent and shown in the Studio workspace
+  (*Runtime did not respond*).
 * `ft_submit_job` is refused in the turn the plan was proposed, and when the notebook changed after
   the proposal (hash check). The plan id makes launching idempotent. The **Launch** button calls
   `POST /finetune/sessions/{id}/plans/{plan}/launch` with the same checks.
@@ -138,7 +146,9 @@ plus `config`, `catalog`, `runtimes` (now includes which agents each runtime's s
 
 ## 10. Verification
 
-* `STORE_BACKEND=json python -m pytest tests -q` → 29 tests. They cover notebook ops, validation,
+* `STORE_BACKEND=json python -m pytest tests -q` → 33 tests (build 38.1 added: runtime tools in
+  the selection turn, tolerant matching, platform-recorded runtime clicks, exact error reporting,
+  prompt upgrade). They cover notebook ops, validation,
   history formatting, runtime scoping (unbound / selected / hidden tools, ADK filters), the
   same-turn and stale-notebook launch refusals, a full job against a simulated runtime that really
   executes the notebook with the platform runner, cancellation, and retiring build 37.

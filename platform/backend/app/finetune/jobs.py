@@ -650,6 +650,13 @@ async def run_job(ctx: JobCtx) -> str:
                         "gpu_type": rt.get("gpu_type", ""), "host": rt.get("host", ""),
                         "server_id": doc["server_id"]})
     ctx.save()
+    # labs are closed after every backend restart: open it here, not inside an MCP call
+    lab_err = await asyncio.to_thread(remote.ensure_lab_open, rt)
+    if lab_err and not resumed:
+        _fail(ctx, "stage", lab_err)
+        return "failed"
+    if lab_err:
+        P.set(run, contact_warning=lab_err[:300])
 
     try:
         if resumed:

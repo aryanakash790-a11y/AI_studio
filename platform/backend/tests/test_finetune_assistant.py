@@ -28,6 +28,8 @@ from app.finetune import jobs, notebook_ops as nbo, remote, seed, session as S, 
 from app.runtime.conversation import format_user_input, wants_full_history  # noqa: E402
 from app.tool_exec import build_tool_defs, execute_tool, set_tool_context  # noqa: E402
 
+MCP_CALLS: list = []
+
 SAMPLES = BACKEND / "app" / "finetune" / "samples"
 RUNNER = BACKEND / "app" / "finetune" / "remote_runner.py"
 
@@ -117,6 +119,17 @@ def bound(monkeypatch):
                 "name": c["name"], "gpu_type": c["gpu_type"], "status": "ready", "provider": "ssh",
                 "enabled": True, "usable": True, "problem": ""}
     monkeypatch.setattr(remote, "describe_server", describe)
+    calls = []
+
+    def call_tool(server, tool, args):
+        calls.append((server["id"], tool, args))
+        if tool == "runtime_info":
+            return f"host: {server['id']}\npython: 3.11\nname, memory.total\nT4, 15360 MiB"
+        return f"ran {tool} {json.dumps(args)}"
+    monkeypatch.setattr(mcp_client, "call_tool", call_tool)
+    monkeypatch.setattr(remote, "ensure_lab_open", lambda rt: "")
+    MCP_CALLS.clear()
+    monkeypatch.setattr(sys.modules[__name__], "MCP_CALLS", calls)
     agent_tools = [{"type": "finetune"}, {"type": "mcp", "ref": SID_A}, {"type": "mcp", "ref": SID_B}]
     conv = f"conv_{uuid.uuid4().hex[:8]}"
     return agent_tools, conv
@@ -134,27 +147,73 @@ def _call(name, **args):
     return out
 
 
-def test_runtime_tools_are_scoped_to_the_selected_bound_runtime(bound):
+def test_runtime_tools_work_in_the_turn_the_runtime_is_chosen(bound):
     agent_tools, conv = bound
     _turn(agent_tools, conv)
     defs, reg = build_tool_defs(agent_tools)
     names = [d["function"]["name"] for d in defs]
-    assert "ft_propose_run" in names
-    assert not any(n.startswith("mcp_") for n in names)              # nothing until the user picks
+    assert "ft_runtime_info" in names and "ft_propose_run" in names
+    assert not any(n.startswith("mcp_") for n in names)              # raw runtime tools never exposed
+    assert _call("ft_runtime_info")["ok"] is False                     # nothing selected yet
 
     rts = _call("ft_list_runtimes")
-    assert {r["name"] for r in rts["runtimes"]} == {"VM-A", "VM-B"}
+    assert {r["label"] for r in rts["runtimes"]} == {"VM-A · T4", "VM-B · A100"}
     assert _call("ft_select_runtime", runtime="nope")["ok"] is False
-    assert _call("ft_select_runtime", runtime="vm-b")["ok"]
+    sel = _call("ft_select_runtime", runtime="VM-B · A100")          # the clicked option text
+    assert sel["ok"] and sel["selected"]["name"] == "VM-B" and sel["runtime_check"]["ok"]
+    info = _call("ft_runtime_info")                                   # same turn
+    assert info["ok"] and SID_B in info["output"]
+    out = _call("ft_run_shell", command="nvidia-smi")
+    assert out["ok"] and MCP_CALLS[-1][:2] == (SID_B, "run_shell")    # through the bound server
+    kept, filters = tools.scope_bindings(agent_tools)
+    assert not [t for t in kept if t.get("type") == "mcp"] and filters == {}
+    assert S.by_conversation(conv)["runtime_check"]["ok"]
 
-    _turn(agent_tools, conv)                                          # next turn
-    defs, reg = build_tool_defs(agent_tools)
-    mcp = {reg[n][1]["tool"]: reg[n][1]["server_id"] for n in reg if reg[n][0] == "mcp"}
-    assert set(mcp) == {"run_python", "runtime_info"}                 # job-control tools hidden
-    assert set(mcp.values()) == {SID_B}                               # only the chosen runtime
-    out, filters = tools.scope_bindings(agent_tools)
-    assert [t.get("ref") for t in out if t.get("type") == "mcp"] == [SID_B]
-    assert "start_notebook_job" not in filters[SID_B]
+
+def test_runtime_matching_is_tolerant_but_never_guesses():
+    cards = [{"name": n, "runtime_id": f"dsl_rt_{n}", "server_name": f"DSLab · {n}",
+              "server_id": f"mcp_dslab_dsl_rt_{n}", "gpu_type": g} for n, g in (("vm1", "T4"), ("vm-2", ""))]
+    m = tools._match_runtime
+    assert m("vm1", cards)["name"] == "vm1"
+    assert m("VM1 · T4", cards)["name"] == "vm1"
+    assert m("Use vm1 please", cards)["name"] == "vm1"
+    assert m("vm-2", cards)["name"] == "vm-2"
+    assert m("dsl_rt_vm1", cards)["name"] == "vm1"
+    assert m("yes", cards) is None                                    # two runtimes: ambiguous
+    assert m("Yes", cards[:1])["name"] == "vm1"                       # the only runtime
+    assert m("something else", cards) is None
+
+
+def test_clicking_a_runtime_option_is_recorded_by_the_platform(bound):
+    agent_tools, conv = bound
+    _turn(agent_tools, conv)
+    q = _call("ft_ask_user", question="Do you want to select VM-A?", options=["Yes", "No"])
+    assert q["ok"]
+    ses = S.by_conversation(conv)
+    assert ses["question"]["purpose"] == "runtime"                    # detected from the text
+    assert ses["question"]["options"] == ["VM-A · T4", "VM-B · A100"]  # platform's own labels
+    rid = f"run_{uuid.uuid4().hex[:8]}"                               # next turn: user clicked
+    set_tool_context(run_id=rid, workflow_id="wf", agent="A", node_id="n1", conversation_id=conv,
+                     agent_tools=agent_tools, message="VM-A · T4")
+    block = tools.prompt_block(agent_tools)
+    ses = S.by_conversation(conv)
+    assert ses["runtime"]["name"] == "VM-A" and ses["question"] is None
+    assert '"selected_runtime": "VM-A"' in block
+
+
+def test_runtime_errors_are_reported_exactly(bound, monkeypatch):
+    agent_tools, conv = bound
+    _turn(agent_tools, conv)
+    monkeypatch.setattr(remote, "ensure_lab_open",
+                        lambda rt: "the DSLab lab for 'VM-A' could not be opened: SSH auth failed")
+    sel = _call("ft_select_runtime", runtime="vm-a")
+    assert sel["ok"] and sel["runtime_check"]["ok"] is False
+    assert "SSH auth failed" in sel["runtime_check"]["error"]
+    assert "SSH auth failed" in S.by_conversation(conv)["runtime_check"]["output"]
+    monkeypatch.setattr(remote, "ensure_lab_open", lambda rt: "")
+    monkeypatch.setattr(mcp_client, "call_tool", lambda s, t, a: "ERROR: kernel died")
+    r = _call("ft_run_python", code="print(1)")
+    assert r["ok"] is False and r["error"] == "ERROR: kernel died"
 
 
 def test_unbound_agent_gets_admin_instructions(bound):
@@ -225,6 +284,7 @@ class FakeRuntime:
         return d
 
     def install(self, mp):
+        mp.setattr(remote, "ensure_lab_open", lambda rt: "")
         mp.setattr(remote, "server_for", lambda sid: ({"id": sid, "env": {}},
                                                       {"id": "testA", "name": "VM-A", "gpu_type": "T4"}))
         mp.setattr(remote, "runtime_mlflow_uri", lambda rt: "")
@@ -365,3 +425,23 @@ def test_legacy_pipeline_is_retired_and_assistant_seeded():
     assert len(wf["nodes"]) == 1 and wf["config"]["chat_history"] == "full" and wf["config"]["template"]
     res = asyncio.run(handlers._registry()["finetune_planner"](None))
     assert res.status == "failed" and "Fine-Tuning Assistant" in res.error
+
+
+def test_seeded_prompt_is_upgraded_but_edits_are_kept():
+    import hashlib
+    from app.store import agents as A
+    seed.seed()
+    a = A.list(lambda x: x["agent_name"] == seed.ASSISTANT)[0]
+    old = "OLD SEEDED PROMPT"
+    seed.SEEDED_PROMPT_SHA256.add(hashlib.sha256(old.encode()).hexdigest())
+    a["prompts"]["system_prompt"] = old
+    A.upsert(a)
+    seed.seed()
+    assert A.get(a["agent_id"])["prompts"]["system_prompt"] == seed.ASSISTANT_PROMPT
+    a = A.get(a["agent_id"])
+    a["prompts"]["system_prompt"] = "my own edited prompt"
+    A.upsert(a)
+    seed.seed()
+    assert A.get(a["agent_id"])["prompts"]["system_prompt"] == "my own edited prompt"
+    a["prompts"]["system_prompt"] = seed.ASSISTANT_PROMPT
+    A.upsert(a)

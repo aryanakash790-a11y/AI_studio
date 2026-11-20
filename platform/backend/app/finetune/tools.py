@@ -18,18 +18,19 @@ Every tool reads the calling run/agent/conversation from tool_exec.tool_context(
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 
 from .. import filestore
 from . import catalog, config, jobs, notebook_ops as nbo, remote, session as S
 
-# DSLab MCP tools that are NOT exposed to a fine-tuning agent: job control goes through the
-# confirmed-plan path, and run_notebook would execute a whole notebook unconfirmed.
-HIDDEN_RUNTIME_TOOLS = {"stage_job_file", "start_notebook_job", "notebook_job_status",
-                        "cancel_notebook_job", "list_job_outputs", "run_notebook"}
-RUNTIME_TOOLS = ["run_python", "run_shell", "runtime_info", "list_files", "read_file",
-                 "write_file", "add_cell", "restart_kernel"]
+# The bound DSLab MCP servers are not exposed to the model tool-by-tool. Instead the toolset
+# offers stable ft_runtime_* tools that call the SELECTED runtime's MCP server. They exist in every
+# turn (also the turn in which the runtime is chosen), need no per-runtime tool names, and keep
+# job control (start_notebook_job, run_notebook, ...) behind the confirmed-plan path.
+YES_WORDS = {"yes", "y", "ok", "okay", "sure", "yes please", "confirm", "confirmed", "go ahead",
+             "select it", "use it", "yes, use it", "yes use it", "correct"}
 
 _RUN_UI: dict[str, dict] = {}          # run_id -> {"jobs": [...]} touched during the step
 
@@ -88,16 +89,6 @@ def _bound(agent_tools: list[dict] | None = None) -> list[str]:
                                       else _ctx().get("agent_tools") or [])
 
 
-def _selected_server(agent_tools: list[dict]) -> str:
-    """The session's runtime, if it is still bound to the agent."""
-    c = _ctx()
-    if not (c.get("conversation_id") or c.get("run_id")):
-        return ""
-    ses = S.by_conversation(c["conversation_id"]) if c.get("conversation_id") else None
-    sid = ((ses or {}).get("runtime") or {}).get("server_id", "")
-    return sid if sid in _bound(agent_tools) else ""
-
-
 # ------------------------------------------------------------------ tool definitions
 def _fn(name: str, desc: str, props: dict | None = None, required: list | None = None) -> dict:
     sch: dict = {"type": "object", "properties": props or {}}
@@ -119,16 +110,28 @@ TOOL_DEFS = [
     _fn("ft_session_status", "Current fine-tuning session: chosen runtime, working notebook and "
         "version, pending plan, recent jobs. Call when unsure of the state."),
     _fn("ft_ask_user", "Ask the user a question and END YOUR TURN. Options are shown as clickable "
-        "choices (e.g. runtimes, notebooks). Use for every decision that is the user's to make.",
+        "choices. For the runtime question set purpose='runtime': the platform fills the options "
+        "with your runtimes and records the user's click itself.",
         {"question": {"type": "string"},
          "options": {"type": "array", "items": {"type": "string"},
-                     "description": "2-8 short choices; omit for a free-text answer"}},
+                     "description": "2-8 short choices; omit for a free-text answer"},
+         "purpose": {"type": "string", "enum": ["runtime", "notebook", "other"]}},
         ["question"]),
     _fn("ft_list_runtimes", "DSLab runtimes this agent may use (its bound, enabled DSLab MCP "
         "servers), with GPU and status, and which one is selected."),
-    _fn("ft_select_runtime", "Record the runtime the USER chose (by name or id). Only after the "
-        "user picked it. Its code tools (run_python, runtime_info, ...) are available from the "
-        "next turn.", {"runtime": {"type": "string"}}, ["runtime"]),
+    _fn("ft_select_runtime", "Record the runtime the USER chose (name, id or the option text they "
+        "clicked) and check it responds. Only after the user picked it.",
+        {"runtime": {"type": "string"}}, ["runtime"]),
+    _fn("ft_runtime_info", "On the selected runtime: hostname, Python, working dir, GPUs. Use it to "
+        "check the runtime works."),
+    _fn("ft_run_python", "Run a short Python snippet on the selected runtime (persistent kernel) and "
+        "return the real output. For checks (versions, data, a quick test) - never the full training.",
+        {"code": {"type": "string"}, "timeout_seconds": {"type": "integer"}}, ["code"]),
+    _fn("ft_run_shell", "Run a shell command on the selected runtime (nvidia-smi, pip list, ls ...).",
+        {"command": {"type": "string"}, "timeout_seconds": {"type": "integer"}}, ["command"]),
+    _fn("ft_runtime_files", "List a folder ('' = workspace root) or read a file in the selected "
+        "runtime's lab workspace.", {"path": {"type": "string"},
+                                     "read": {"type": "boolean", "description": "true = read the file"}}),
     _fn("ft_list_notebooks", "Template notebooks (File Storage › finetuning/notebooks) with "
         "description and parameters, plus this conversation's drafts."),
     _fn("ft_read_notebook", "Read a notebook's cells with their indices, tags and parameters.",
@@ -175,17 +178,16 @@ TOOL_NAMES = [d["function"]["name"] for d in TOOL_DEFS]
 
 
 def extend(defs: list, registry: dict, agent_tools: list[dict]) -> tuple[list, dict]:
-    """Add the ft_* tools and scope DSLab runtime MCP tools to the session's runtime."""
+    """Add the ft_* tools. The raw tools of the bound DSLab runtime MCP servers are removed:
+    the agent reaches the selected runtime through ft_runtime_* (same MCP server, same tools)."""
     bound = set(_bound(agent_tools))
-    selected = _selected_server(agent_tools)
     keep_defs = []
     for d in defs:
         name = d["function"]["name"]
         entry = registry.get(name)
         if entry and entry[0] == "mcp" and entry[1].get("server_id") in bound:
-            if entry[1]["server_id"] != selected or entry[1]["tool"] in HIDDEN_RUNTIME_TOOLS:
-                registry.pop(name, None)
-                continue
+            registry.pop(name, None)
+            continue
         keep_defs.append(d)
     for d in TOOL_DEFS:
         keep_defs.append(d)
@@ -194,19 +196,94 @@ def extend(defs: list, registry: dict, agent_tools: list[dict]) -> tuple[list, d
 
 
 def scope_bindings(agent_tools: list[dict]) -> tuple[list[dict], dict]:
-    """For ADK native MCP toolsets: drop unselected runtimes, filter the selected one."""
+    """For ADK native MCP toolsets: bound DSLab runtime servers are reached via ft_runtime_*."""
     bound = set(_bound(agent_tools))
-    selected = _selected_server(agent_tools)
     out = [t for t in agent_tools or []
-           if not (t.get("type") == "mcp" and (t.get("ref") or t.get("server_id")) in bound
-                   and (t.get("ref") or t.get("server_id")) != selected)]
-    return out, ({selected: list(RUNTIME_TOOLS)} if selected else {})
+           if not (t.get("type") == "mcp" and (t.get("ref") or t.get("server_id")) in bound)]
+    return out, {}
+
+
+# ------------------------------------------------------------------ runtime choice + calls
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _label(card: dict) -> str:
+    return f"{card['name'].strip()} · {card['gpu_type']}" if card.get("gpu_type") else card["name"].strip()
+
+
+def _match_runtime(want: str, cards: list[dict]) -> dict | None:
+    """Tolerant match of what the user/model said to one bound runtime: name, id, server name,
+    the clickable option label ('vm1 · T4'), 'use vm1', or a plain 'yes' when only one exists."""
+    w = _norm(want)
+    if not w:
+        return None
+    if w.rstrip(".! ") in YES_WORDS and len(cards) == 1:
+        return cards[0]
+    w = re.sub(r"^(please\s+)?(use|select|choose|pick|go with|runtime)\s+", "", w).strip(" .!'\"")
+    heads = {w, re.split(r"\s*[·(\-,|]\s*", w)[0].strip()}
+    for c in cards:
+        keys = {_norm(c["name"]), _norm(c["runtime_id"]), _norm(c["server_name"]),
+                _norm(c["server_id"]), _norm(_label(c))}
+        if heads & keys:
+            return c
+    hits = [c for c in cards if _norm(c["name"]) and re.search(rf"(^|\W){re.escape(_norm(c['name']))}(\W|$)", w)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _runtime_call(tool: str, args: dict) -> tuple[bool, str, dict]:
+    """Call a tool of the SELECTED runtime's bound DSLab MCP server. (ok, text, runtime)."""
+    from .. import mcp_client, mcp_store
+    ses = _session()
+    rt = ses.get("runtime") or {}
+    sid = rt.get("server_id", "")
+    if not sid:
+        return False, "No runtime selected yet - ask the user to choose one (ft_ask_user purpose='runtime').", {}
+    if sid not in _bound():
+        return False, (f"runtime '{rt.get('name')}' is no longer bound to this agent "
+                       f"(Agent Garden › Tools › MCP servers)"), rt
+    card = remote.describe_server(sid)
+    if not card["usable"]:
+        return False, f"runtime '{rt.get('name')}' cannot be used: {card['problem']}", rt
+    from ..modules.data_science_lab import store as dsl_store
+    lab_err = remote.ensure_lab_open(dsl_store.get_runtime(card["runtime_id"]) or {"id": card["runtime_id"],
+                                                                                   "name": card["name"]})
+    if lab_err:
+        return False, lab_err, rt
+    out = mcp_client.call_tool(mcp_store.get_server(sid), tool, args) or ""
+    return (not remote.is_error_text(out)), out, rt
+
+
+def _record_check(ses_id: str, ok: bool, text: str) -> None:
+    S.update(ses_id, runtime_check={"ok": ok, "at": _now(), "output": (text or "")[:1500]})
+
+
+def _choose_runtime(ses: dict, card: dict, how: str) -> dict:
+    rt = {k: card[k] for k in ("server_id", "runtime_id", "name", "gpu_type")}
+    S.update(ses["session_id"], run_id=_ctx().get("run_id", ""), event=f"runtime {card['name']} ({how})",
+             runtime=rt, question=None, runtime_check=None)
+    return rt
+
+
+def _apply_pending_choice(ses: dict) -> dict:
+    """Start of a turn: if the user just answered the runtime question (clicked an option or
+    said yes to the only runtime), record it now - no model interpretation needed."""
+    q = ses.get("question") or {}
+    msg = _ctx().get("message", "")
+    if q.get("purpose") != "runtime" or not msg or q.get("run_id") == _ctx().get("run_id"):
+        return ses
+    cards = [remote.describe_server(x) for x in _bound()]
+    card = _match_runtime(msg, [c for c in cards if c["usable"]])
+    if card:
+        _choose_runtime(ses, card, "chosen by the user")
+        return S.get(ses["session_id"]) or ses
+    return ses
 
 
 # ------------------------------------------------------------------ prompt + UI
 def prompt_block(agent_tools: list[dict]) -> str:
     """Session state injected into every turn so the agent never loses track."""
-    ses = _session()
+    ses = _apply_pending_choice(_session())
     bound = [remote.describe_server(s) for s in _bound(agent_tools)]
     rt = ses.get("runtime") or {}
     nb = ses.get("notebook") or {}
@@ -217,6 +294,8 @@ def prompt_block(agent_tools: list[dict]) -> str:
                                        **({"problem": b["problem"]} if b["problem"] else {})}
                                       for b in bound] or "NONE - no DSLab runtime MCP server is bound to you",
         "selected_runtime": rt.get("name") or None,
+        "runtime_check": ((ses.get("runtime_check") or {}) if rt else None) or
+                         ("not checked yet - call ft_runtime_info" if rt else None),
         "working_notebook": ({"path": nb.get("path"), "version": nb.get("version"),
                               "based_on": nb.get("base")} if nb else None),
         "pending_plan": ({"plan_id": plan.get("plan_id"), "status": plan.get("status"),
@@ -288,9 +367,19 @@ def t_ask(a):
     if not q:
         return _err("question is required")
     opts = [str(o)[:120] for o in (a.get("options") or []) if str(o).strip()][:8]
+    purpose = str(a.get("purpose") or "other").lower()
+    if purpose != "runtime" and any(w in q.lower() for w in ("runtime", "machine", " vm", "gpu")) \
+            and not (ses.get("runtime") or {}).get("server_id"):
+        purpose = "runtime"                     # a runtime question, whatever the model called it
+    if purpose == "runtime":
+        cards = [c for c in (remote.describe_server(x) for x in _bound()) if c["usable"]]
+        if not cards:
+            return _err("No usable runtime is bound to this agent - call ft_list_runtimes and tell "
+                        "the user the problem it reports.")
+        opts = [_label(c) for c in cards]       # the platform's own labels, matched on reply
     S.update(ses["session_id"], run_id=_ctx().get("run_id", ""), event=f"asked: {q[:120]}",
-             question={"text": q[:600], "options": opts, "run_id": _ctx().get("run_id", ""),
-                       "asked_at": _now()})
+             question={"text": q[:600], "options": opts, "purpose": purpose,
+                       "run_id": _ctx().get("run_id", ""), "asked_at": _now()})
     return _ok(shown_to_user=True, note="The question is shown with clickable options. Write ONE "
                "short sentence and end your turn now; the user's choice arrives as the next message.")
 
@@ -301,6 +390,7 @@ def t_runtimes(a):
     sel = (ses.get("runtime") or {}).get("server_id")
     for c in cards:
         c["selected"] = c["server_id"] == sel
+        c["label"] = _label(c)
     if not cards:
         return _err("No DSLab runtime is bound to this agent. Ask an admin to: (1) Data Science Lab › "
                     "runtime › Enable agent access, then (2) Agent Garden › edit this agent › Tools › "
@@ -311,18 +401,55 @@ def t_runtimes(a):
 
 def t_select_runtime(a):
     ses = _session()
-    want = str(a.get("runtime") or "").strip().lower()
-    for sid in _bound():
-        c = remote.describe_server(sid)
-        if want in (sid.lower(), c["runtime_id"].lower(), c["name"].lower(), c["server_name"].lower()):
-            if not c["usable"]:
-                return _err(f"runtime '{c['name']}' cannot be used: {c['problem']}")
-            rt = {k: c[k] for k in ("server_id", "runtime_id", "name", "gpu_type")}
-            S.update(ses["session_id"], run_id=_ctx().get("run_id", ""), event=f"runtime {c['name']}",
-                     runtime=rt, question=None)
-            return _ok(selected=rt, note="Runtime recorded. Its code tools are available from the next turn.")
-    return _err(f"'{a.get('runtime')}' is not one of your runtimes",
-                runtimes=[remote.describe_server(s)["name"] for s in _bound()])
+    cards = [remote.describe_server(x) for x in _bound()]
+    if not cards:
+        return t_runtimes(a)
+    card = _match_runtime(str(a.get("runtime") or ""), cards)
+    if not card:
+        return _err(f"'{a.get('runtime')}' does not match a runtime of this agent - pass one of the names",
+                    runtimes=[c["name"] for c in cards])
+    if not card["usable"]:
+        return _err(f"runtime '{card['name']}' cannot be used: {card['problem']}")
+    rt = _choose_runtime(ses, card, "selected by the assistant")
+    ok, text, _ = _runtime_call("runtime_info", {})
+    _record_check(ses["session_id"], ok, text)
+    if ok:
+        return _ok(selected=rt, runtime_check={"ok": True, "info": text[:2000]})
+    return _ok(selected=rt, runtime_check={"ok": False, "error": text[:2000]},
+               note="The runtime is selected but did not respond. Tell the user this exact error "
+                    "and how to fix it; do not describe it vaguely.")
+
+
+def _proxy(tool: str, args: dict) -> str:
+    ok, text, rt = _runtime_call(tool, args)
+    ses = _session()
+    if tool == "runtime_info":
+        _record_check(ses["session_id"], ok, text)
+    if ok:
+        return _ok(runtime=rt.get("name"), output=text[:15000])
+    return _err(text[:3000], runtime=rt.get("name"),
+                note="Quote this error to the user exactly and suggest the fix.")
+
+
+def t_runtime_info(a):
+    return _proxy("runtime_info", {})
+
+
+def t_run_python(a):
+    return _proxy("run_python", {"code": str(a.get("code") or ""),
+                                 "timeout_seconds": int(a.get("timeout_seconds") or 120)})
+
+
+def t_run_shell(a):
+    return _proxy("run_shell", {"command": str(a.get("command") or ""),
+                                "timeout_seconds": int(a.get("timeout_seconds") or 120)})
+
+
+def t_runtime_files(a):
+    path = str(a.get("path") or "")
+    if a.get("read"):
+        return _proxy("read_file", {"path": path})
+    return _proxy("list_files", {"path": path})
 
 
 def t_list_notebooks(a):
@@ -561,7 +688,9 @@ def t_list_jobs(a):
 
 _HANDLERS = {
     "ft_session_status": t_status, "ft_ask_user": t_ask, "ft_list_runtimes": t_runtimes,
-    "ft_select_runtime": t_select_runtime, "ft_list_notebooks": t_list_notebooks,
+    "ft_select_runtime": t_select_runtime, "ft_runtime_info": t_runtime_info,
+    "ft_run_python": t_run_python, "ft_run_shell": t_run_shell, "ft_runtime_files": t_runtime_files,
+    "ft_list_notebooks": t_list_notebooks,
     "ft_read_notebook": t_read, "ft_create_notebook": t_create, "ft_edit_notebook": t_edit,
     "ft_validate_notebook": t_validate, "ft_diff_notebook": t_diff,
     "ft_save_as_template": t_save_template, "ft_list_datasets": t_datasets,

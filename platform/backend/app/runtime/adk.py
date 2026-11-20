@@ -235,7 +235,9 @@ class AdkRuntime:
             _agent_tools = _card.get("tools", []) or []
             set_tool_context(run_id=rid, workflow_id=run.workflow_id or "", agent=agent_name,
                              node_id=node_id, conversation_id=conversation_id,
-                             agent_tools=_agent_tools)
+                             agent_tools=_agent_tools,
+                             message=str((run.input or {}).get("message") or "")
+                             if isinstance(run.input, dict) else str(run.input or ""))
             agent = self._build_agent(agent_name, extra_tools, extra_instruction)
             runner = Runner(agent=agent, app_name="platform", session_service=session_service)
             await session_service.create_session(app_name="platform", user_id="u",

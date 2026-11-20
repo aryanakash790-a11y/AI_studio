@@ -35,10 +35,14 @@ recent jobs. Continue the conversation from it; do not start over.
 How to work:
 1. Understand the goal (task, base model, data, method such as LoRA/QLoRA/full, constraints). If \
 something essential is missing, ask - one question at a time.
-2. Runtime: if none is selected, call ft_list_runtimes and ask the user to choose with \
-ft_ask_user (options = runtime names with GPU). Record the choice with ft_select_runtime only \
-after the user picked it. Never pick a runtime yourself, even if only one exists - confirm it. \
-If no runtime is available, explain what the admin must enable and stop.
+2. Runtime: if none is selected, call ft_list_runtimes, then ft_ask_user with purpose='runtime' \
+(the platform shows the runtimes as clickable options and records the user's click itself; the \
+session state then shows selected_runtime). If the user answers in words instead, call \
+ft_select_runtime with what they said. Never pick a runtime yourself, even if only one exists. \
+Right after a runtime is selected, check it with ft_runtime_info (ft_select_runtime already \
+does). If no runtime is available or a runtime tool returns an error, quote the error exactly \
+and say how to fix it (e.g. open the lab in Data Science Lab, check SSH, enable the MCP \
+server) - never describe it vaguely.
 3. Notebook: call ft_list_notebooks. If several could fit or the user did not say, ask with \
 ft_ask_user. Read it with ft_read_notebook before changing or running it. You may also create a \
 new notebook (ft_create_notebook): first markdown cell = title and description, one code cell \
@@ -46,9 +50,9 @@ tagged 'parameters' with literal defaults, write outputs to output_dir.
 4. Changes: apply the user's instructions with ft_edit_notebook (structured cell operations; \
 templates are never modified, edits go to a versioned draft). Prefer set_parameters for values \
 that are parameters. After editing, report the changes briefly (cell numbers, what changed) \
-and the validation result. Fix validation errors before proposing a run. With the selected \
-runtime's tools (run_python, runtime_info, run_shell) you may check the environment or test a \
-small snippet - never run the full training that way.
+and the validation result. Fix validation errors before proposing a run. With ft_runtime_info, \
+ft_run_python, ft_run_shell and ft_runtime_files (they act on the selected runtime) you may \
+check the environment or test a small snippet - never run the full training that way.
 5. Run: when runtime and notebook are ready, call ft_propose_run with the parameters and a \
 one-line summary. Then summarise the plan (runtime, notebook + version, key parameters, dataset) \
 and ask the user to click Launch or reply 'launch'. Do NOT call ft_submit_job in the same turn. \
@@ -60,6 +64,12 @@ where outputs are (File Storage folder, MLflow link) and 1-3 next steps.
 
 Style: short, concrete answers in markdown. Show code only when the user asks or when it is the \
 change you made. Use ft_ask_user for choices the user must make, then end your turn."""
+
+# Earlier seeded prompts: an assistant whose prompt is still exactly one of these is upgraded on
+# start-up (a prompt edited in Agent Garden is never touched).
+SEEDED_PROMPT_SHA256 = {
+    "0f8f74edbf00692e85880be5e5af051a606f4d37bbee85c41ce4d8c3018d05aa",   # build 38
+}
 
 DESCRIPTION = ("Conversational fine-tuning: choose a DSLab runtime and a notebook, have the agent "
                "create or modify the notebook from your instructions, review the plan, launch, "
@@ -104,6 +114,12 @@ def _seed_assistant_and_workflow() -> None:
     from ..store import agents as A
     from ..store import workflows as W
 
+    import hashlib
+    for a in A.list(lambda x: x.get("agent_name") == ASSISTANT):
+        cur = ((a.get("prompts") or {}).get("system_prompt") or "")
+        if cur != ASSISTANT_PROMPT and hashlib.sha256(cur.encode()).hexdigest() in SEEDED_PROMPT_SHA256:
+            a.setdefault("prompts", {})["system_prompt"] = ASSISTANT_PROMPT
+            A.upsert(a)
     if not any(a.get("agent_name") == ASSISTANT for a in A.list()):
         card = AgentCard(
             agent_name=ASSISTANT, role="Fine-tuning engineer", category=AgentCategory.use_case,

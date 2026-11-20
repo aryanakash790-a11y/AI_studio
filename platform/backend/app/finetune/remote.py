@@ -88,6 +88,34 @@ def server_for(sid: str) -> tuple[dict, dict]:
     return server, rt
 
 
+def ensure_lab_open(rt: dict) -> str:
+    """Open the runtime's lab (SSH tunnel + Jupyter) from the backend if it is not open.
+
+    Lab tunnels live in the backend process, so after every backend restart or redeploy all labs
+    are closed. The DSLab MCP server can re-open a lab itself, but only inside one MCP tool call,
+    and an SSH connect + Jupyter start can take longer than that call is allowed. Doing it here,
+    first, avoids the timeout and gives the exact reason when it fails. Returns "" when the lab
+    is open, else the error."""
+    from ..modules.data_science_lab import session as dsl_session
+    try:
+        if dsl_session.get_tunnel_port(rt["id"]) is not None:
+            return ""
+        r = dsl_session.open_lab(rt["id"])
+    except Exception as e:
+        return f"opening the DSLab lab for '{rt.get('name', rt['id'])}' failed: {type(e).__name__}: {e}"
+    if r.get("ok"):
+        return ""
+    steps = "; ".join(f"{s.get('step')}: {s.get('detail') or ('ok' if s.get('ok') else 'failed')}"
+                      for s in (r.get("steps") or []) if isinstance(s, dict))
+    return (f"the DSLab lab for '{rt.get('name', rt['id'])}' could not be opened: "
+            f"{r.get('detail') or 'unknown error'}" + (f" ({steps})" if steps else ""))
+
+
+def is_error_text(text: str) -> bool:
+    t = (text or "").strip()
+    return t.startswith("ERROR:") or t.startswith('{"error"')
+
+
 def runtime_mlflow_uri(rt: dict) -> str:
     return (config.get().get("remote_mlflow_uri") or rt.get("mlflow_uri")
             or config.backend_mlflow_uri() or "")
